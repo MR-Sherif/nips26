@@ -183,18 +183,15 @@ def pre_load_features(cfg, split, model, loader):
 
 
 def extract_clip_features(dataloader, model, device):
-    """Extracts both global [CLS] token and fine-grained patch tokens."""
     global_features, patch_features, labels = [], [], []
-    
     with torch.no_grad():
         for images, target in tqdm(dataloader, desc="Extracting Features"):
             images = images.to(device)
             target = target.to(device)
             
-            # Note: Depending on your specific CLIP model (ViT vs ResNet), 
-            # you might need to modify model.encode_image to return dense patches.
-            # Assuming ViT here where sequence output is [B, P, D] and global is [B, D]
             image_features, dense_patches = model.encode_image(images) 
+            
+            # --- CRITICAL FIX: L2 NORMALIZE NATIVELY ---
             image_features = F.normalize(image_features, dim=-1)
             dense_patches = F.normalize(dense_patches, dim=-1)
             
@@ -222,23 +219,33 @@ def main():
     
     # 2. Extract Few-Shot Support Set
     print("Extracting Few-Shot Support Set (Initialization)...")
-    _, support_patches, support_labels = extract_clip_features(train_loader, clip_model, DEVICE)
+    support_global, support_patches, support_labels = extract_clip_features(train_loader, clip_model, DEVICE)
     
-    # Flatten support patches to shape [N, D] for the memory bank
-    # B = batch, P = patches, D = dim
+    # Cast to float
+    support_global = support_global.float()
+    support_labels = support_labels # Shape [N]
+    
+    # Flatten support patches to shape [N*P, D] for the memory bank
     B, P, D = support_patches.shape
     support_patches_flat = support_patches.view(-1, D).float()
     support_labels_flat = support_labels.unsqueeze(1).expand(-1, P).reshape(-1)
     
-    # 3. Initialize 
-    ALPHA = 1.5
+    # 3. Initialize Model
+    ALPHA = 1.5 
     print("Initializing Continuous Episodic Graph Memory...")
     model = ContinuousEpisodicVLM(feature_dim=D, num_classes=len(dataset.classnames), tau_conf=0.8)
     model.memory.alpha = ALPHA
     model.to(DEVICE)
-    model.eval() # MUST REMAIN IN EVAL. No Backprop!
+    model.eval() 
     
-    model.memory.initialize_memory(support_patches_flat, support_labels_flat, text_features)
+    # Pass ALL the arguments required for the fixed Global/Local separation
+    model.memory.initialize_memory(
+        support_global=support_global, 
+        support_labels=support_labels, 
+        support_patches=support_patches_flat, 
+        support_patches_labels=support_labels_flat, 
+        text_features=text_features
+    )
     
     # 4. The Streaming Inference Loop
     print("Starting Continuous Test-Time Adaptation Stream...")
