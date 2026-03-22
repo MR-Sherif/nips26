@@ -239,11 +239,11 @@ def main():
     model.eval() 
     
     # Pass ALL the arguments required for the fixed Global/Local separation
+    # (NEW) Mean-Pooling Initialization
+    # (NEW) Mean-Pooling Initialization
     model.memory.initialize_memory(
-        support_global=support_global, 
-        support_labels=support_labels, 
         support_patches=support_patches_flat, 
-        support_patches_labels=support_labels_flat, 
+        support_labels=support_labels_flat, 
         text_features=text_features
     )
     
