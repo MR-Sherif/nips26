@@ -235,28 +235,6 @@ class VisionTransformer(nn.Module):
 
         return x
 
-    def encode_image_dense(self, x):
-        # Pass through embeddings and transformer layers...
-        x = self.conv1(x)
-        x = x.reshape(x.shape[0], x.shape[1], -1) 
-        x = x.permute(0, 2, 1)  
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  
-        x = x + self.positional_embedding.to(x.dtype)
-        x = self.ln_pre(x)
-
-        x = x.permute(1, 0, 2)
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)
-
-        global_feat = self.ln_post(x[:, 0, :])
-        patch_feats = self.ln_post(x[:, 1:, :]) # Extract patches
-
-        if self.proj is not None:
-            global_feat = global_feat @ self.proj
-            patch_feats = patch_feats @ self.proj
-
-        return global_feat, patch_feats
-
 class CLIP(nn.Module):
     def __init__(self,
                  embed_dim: int,
@@ -356,9 +334,6 @@ class CLIP(nn.Module):
 
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
-    
-    def encode_image_dense(self, image):
-        return self.visual.encode_image_dense(image.type(self.dtype))
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]

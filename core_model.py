@@ -4,10 +4,11 @@ import torch.nn.functional as F
 from torch_geometric.nn import HGTConv
 
 class TopologicalGraphMemory(nn.Module):
-    def __init__(self, feature_dim, num_classes):
+    def __init__(self, feature_dim, num_classes, alpha=1.0):
         super().__init__()
         self.feature_dim = feature_dim
         self.num_classes = num_classes
+        self.alpha = alpha
         
         # Episodic Graph State (Persists in VRAM)
         self.register_buffer('memory_nodes', torch.empty(0, feature_dim))  # V_cache
@@ -50,8 +51,8 @@ class TopologicalGraphMemory(nn.Module):
         visual_prototypes = self.class_sums / safe_counts
         visual_prototypes = F.normalize(visual_prototypes, dim=-1)
         
-        # Tip-Adapter style blending: Text + Mean Visual Memory
-        unified_prototypes = self.textual_anchors + visual_prototypes
+        # Tip-Adapter style blending: Text + (Alpha * Mean Visual Memory)
+        unified_prototypes = self.textual_anchors + (self.alpha * visual_prototypes)
         return F.normalize(unified_prototypes, dim=-1)
 
     def write_to_memory(self, patches, pred_class):
