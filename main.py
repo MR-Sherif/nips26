@@ -1,16 +1,18 @@
 import os
 import torch
 import clip
+import math
 from tqdm import tqdm
 
 from utils import clip_classifier
 from datasets import build_dataset
 from datasets.utils import build_data_loader
 from core_model import ContinuousEpisodicVLM
+import torch.nn.functional as F
 
 # --- Setup & Hyperparameters ---
-DATASET_NAME = 'imagenet' # Swap for your 11 datasets
-DATA_PATH = './data'
+DATASET_NAME = 'fgvc' # Swap for your 11 datasets
+DATA_PATH = '/home/user/codex/FewShot/TipAdapter/data'
 SHOTS = 16
 BACKBONE = 'RN50' # or ViT-B/16
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -192,7 +194,9 @@ def extract_clip_features(dataloader, model, device):
             # Note: Depending on your specific CLIP model (ViT vs ResNet), 
             # you might need to modify model.encode_image to return dense patches.
             # Assuming ViT here where sequence output is [B, P, D] and global is [B, D]
-            image_features, dense_patches = model.encode_image_dense(images) 
+            image_features, dense_patches = model.encode_image(images) 
+            image_features = F.normalize(image_features, dim=-1)
+            dense_patches = F.normalize(dense_patches, dim=-1)
             
             global_features.append(image_features)
             patch_features.append(dense_patches)
@@ -204,6 +208,7 @@ def main():
     print(f"Loading CLIP {BACKBONE}...")
     clip_model, preprocess = clip.load(BACKBONE, device=DEVICE)
     clip_model.eval()
+    clip_model = patch_open_clip_model(clip_model)
     
     # 1. Load Dataset using Tip-Adapter's boilerplate
     print(f"Preparing {DATASET_NAME} dataset...")
@@ -213,7 +218,7 @@ def main():
     
     print("Extracting Textual Anchors...")
     text_features = clip_classifier(dataset.classnames, dataset.template, clip_model)
-    text_features = text_features.t()
+    text_features = text_features.t().float()
     
     # 2. Extract Few-Shot Support Set
     print("Extracting Few-Shot Support Set (Initialization)...")
@@ -222,7 +227,7 @@ def main():
     # Flatten support patches to shape [N, D] for the memory bank
     # B = batch, P = patches, D = dim
     B, P, D = support_patches.shape
-    support_patches_flat = support_patches.view(-1, D)
+    support_patches_flat = support_patches.view(-1, D).float()
     support_labels_flat = support_labels.unsqueeze(1).expand(-1, P).reshape(-1)
     
     # 3. Initialize 
@@ -247,9 +252,9 @@ def main():
             target = target.to(DEVICE)
             
             # Extract test features
-            test_global, test_patches = clip_model.encode_image_dense(images)
-            test_global = test_global.squeeze(0) # [D]
-            test_patches = test_patches.squeeze(0) # [P, D]
+            test_global, test_patches = clip_model.encode_image(images)
+            test_global = F.normalize(test_global.squeeze(0).float(), dim=-1) 
+            test_patches = F.normalize(test_patches.squeeze(0).float(), dim=-1)
             
             # Forward Pass through Dynamic Topology
             logits, steps = model(test_global, test_patches, max_steps=3)

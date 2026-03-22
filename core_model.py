@@ -65,51 +65,100 @@ class TopologicalGraphMemory(nn.Module):
         self.class_counts[pred_class] += patches.size(0)
 
 
+# class System2Reasoner(nn.Module):
+#     def __init__(self, feature_dim, top_k=50):
+#         super().__init__()
+#         self.top_k = top_k
+        
+#         # Modality-aware Graph Transformer (MGT) using PyG
+#         # We define a simple heterogeneous setup: 'memory' nodes to 'test' patches
+#         self.hgt_conv = HGTConv(
+#             in_channels={'test': feature_dim, 'memory': feature_dim},
+#             out_channels=feature_dim,
+#             metadata=(['test', 'memory'], [('memory', 'interacts', 'test')]),
+#             heads=4,
+#             # group='sum'
+#         )
+        
+#         # Inductive Token Evidence Scorer (Projects patch to an evidence scalar)
+#         self.evidence_scorer = nn.Sequential(
+#             nn.Linear(feature_dim, feature_dim // 2),
+#             nn.ReLU(),
+#             nn.Linear(feature_dim // 2, 1)
+#         )
+
+#     def compute_exact_topk_subgraph(self, test_patches, memory_nodes_gpu):
+#         """Exact dense-to-sparse routing WITH Dynamic Subgraph Extraction to save VRAM."""
+#         P = test_patches.size(0)
+        
+#         # Exact dot product similarity against FULL memory
+#         sim_matrix = torch.matmul(test_patches, memory_nodes_gpu.T) # [P, N]
+        
+#         K = min(self.top_k, memory_nodes_gpu.size(0))
+#         _, topk_indices = torch.topk(sim_matrix, k=K, dim=1) # [P, K]
+        
+#         # --- THE FIX: DYNAMIC SUBGRAPH EXTRACTION ---
+#         flat_topk = topk_indices.reshape(-1)
+#         # Find the unique memory nodes actually needed for this pass
+#         unique_mem_idx, inverse_idx = torch.unique(flat_topk, return_inverse=True)
+        
+#         # Extract only the active nodes (Shrinks memory size from ~300k to max 9800)
+#         active_memory_nodes = memory_nodes_gpu[unique_mem_idx]
+        
+#         # Build PyG Edge Index [2, P * K]
+#         test_node_idx = torch.arange(P, device=test_patches.device).view(-1, 1).expand(-1, K).reshape(-1)
+        
+#         # The new edges map from the small active memory pool to the test patches
+#         dynamic_edge_index = torch.stack([inverse_idx, test_node_idx], dim=0)
+        
+#         return dynamic_edge_index, active_memory_nodes
+
+#     def token_evidence_pooling(self, patches):
+#         """Assigns high weights to discriminative patches, suppresses noisy background."""
+#         evidence_logits = self.evidence_scorer(patches) # [P, 1]
+#         evidence_weights = F.softmax(evidence_logits, dim=0)
+#         global_feature = (patches * evidence_weights).sum(dim=0, keepdim=True)
+#         return F.normalize(global_feature, dim=-1)
+
+
+
 class System2Reasoner(nn.Module):
-    def __init__(self, feature_dim, top_k=50):
+    def __init__(self, feature_dim, top_k=50, tau=0.02):
         super().__init__()
         self.top_k = top_k
-        
-        # Modality-aware Graph Transformer (MGT) using PyG
-        # We define a simple heterogeneous setup: 'memory' nodes to 'test' patches
-        self.hgt_conv = HGTConv(
-            in_channels={'test': feature_dim, 'memory': feature_dim},
-            out_channels=feature_dim,
-            metadata=(['test', 'memory'], [('memory', 'interacts', 'test')]),
-            heads=4,
-            group='sum'
-        )
-        
-        # Inductive Token Evidence Scorer (Projects patch to an evidence scalar)
-        self.evidence_scorer = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim // 2),
-            nn.ReLU(),
-            nn.Linear(feature_dim // 2, 1)
-        )
+        self.tau = tau
+        # ALL RANDOM WEIGHTS REMOVED. 100% Training-Free.
 
-    def compute_exact_topk_edges(self, test_patches, memory_nodes):
-        """Exact dense-to-sparse routing using pure tensor cores (Bypasses ANN accuracy drop)."""
+    def forward(self, test_patches, memory_nodes_gpu):
         P = test_patches.size(0)
         
-        # Exact dot product similarity
-        sim_matrix = torch.matmul(test_patches, memory_nodes.T) # [P, N]
+        # 1. Exact Dot Product Similarity
+        sim_matrix = torch.matmul(test_patches, memory_nodes_gpu.T) # [P, N]
         
-        # Avoid K > N during the very first few test samples
-        K = min(self.top_k, memory_nodes.size(0))
-        _, topk_indices = torch.topk(sim_matrix, k=K, dim=1) # [P, K]
+        # 2. Extract Top-K Nodes per Patch
+        K = min(self.top_k, memory_nodes_gpu.size(0))
+        topk_sim, topk_indices = torch.topk(sim_matrix, k=K, dim=1) # [P, K]
         
-        # Build PyG Edge Index [2, P * K]
-        test_node_idx = torch.arange(P, device=test_patches.device).view(-1, 1).expand(-1, K).reshape(-1)
-        memory_node_idx = topk_indices.reshape(-1)
+        # 3. Softmax over Top-K to get Attention Weights
+        attn_weights = F.softmax(topk_sim / self.tau, dim=1) # [P, K]
         
-        return torch.stack([memory_node_idx, test_node_idx], dim=0)
-
-    def token_evidence_pooling(self, patches):
-        """Assigns high weights to discriminative patches, suppresses noisy background."""
-        evidence_logits = self.evidence_scorer(patches) # [P, 1]
-        evidence_weights = F.softmax(evidence_logits, dim=0)
-        global_feature = (patches * evidence_weights).sum(dim=0, keepdim=True)
-        return F.normalize(global_feature, dim=-1)
+        # 4. Gather the actual memory nodes
+        gathered_memory = memory_nodes_gpu[topk_indices] # [P, K, D]
+        
+        # 5. Parameter-Free Message Passing (Weighted Sum)
+        messages = (attn_weights.unsqueeze(-1) * gathered_memory).sum(dim=1) # [P, D]
+        
+        # Residual Connection
+        updated_patches = test_patches + messages
+        updated_patches = F.normalize(updated_patches, dim=-1)
+        
+        # 6. Training-Free Token Evidence 
+        # (Use the highest similarity score to the memory graph as evidence weight)
+        evidence_scores = topk_sim[:, 0] 
+        evidence_weights = F.softmax(evidence_scores / self.tau, dim=0).unsqueeze(-1) # [P, 1]
+        
+        global_feature = (updated_patches * evidence_weights).sum(dim=0, keepdim=True)
+        return F.normalize(global_feature, dim=-1), updated_patches
 
 
 class ContinuousEpisodicVLM(nn.Module):
@@ -149,28 +198,20 @@ class ContinuousEpisodicVLM(nn.Module):
             
             return sys1_logits, 0 # Return logits and steps taken (0)
 
-        # --- Step 3.4: System 2 (Iterative Graph Reasoner) ---
         current_patches = test_patches
         step = 0
         final_logits = sys1_logits
         
+        # CPU Offloading fetch
+        memory_nodes_gpu = self.memory.memory_nodes.to(test_patches.device, non_blocking=True)
+        
         while entropy > self.tau_conf and step < max_steps:
-            # 1. Dynamic Edge Formation (Read Query)
-            edge_index = self.system2.compute_exact_topk_edges(current_patches, self.memory.memory_nodes)
             
-            # 2. HGT Message Passing
-            x_dict = {'test': current_patches, 'memory': self.memory.memory_nodes}
-            edge_index_dict = {('memory', 'interacts', 'test'): edge_index}
+            # --- THE FIX: One-Line Parameter-Free Graph Reasoning ---
+            global_updated, current_patches = self.system2(current_patches, memory_nodes_gpu)
             
-            updated_dict = self.system2.hgt_conv(x_dict, edge_index_dict)
-            current_patches = current_patches + updated_dict['test'] # Residual connection
-            current_patches = F.normalize(current_patches, dim=-1)
-            
-            # 3. Step 3.5: Final Resolution via Token Evidence
-            global_updated = self.system2.token_evidence_pooling(current_patches)
+            # 3. Router Re-evaluation
             final_logits = 100.0 * global_updated @ sys1_prototypes.T
-            
-            # 4. Router Re-evaluation
             entropy = self.calculate_entropy(final_logits)
             step += 1
             pred_class = final_logits.argmax(dim=-1).item()
